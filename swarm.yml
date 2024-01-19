@@ -1,0 +1,495 @@
+heat_template_version: ocata
+
+description: >
+    Heat Template for Swarm Cluster LAB
+    Create:
+      Network, subnet and router
+      SecGroup for Ping and SSH
+      Docker instances
+      Local Docker registry
+      Reverse proxy - gateway 
+
+parameters:
+  key:
+    type: string
+    label: Key name
+    description: Name of key-pair to be used for compute instance
+    constraints:
+      - custom_constraint: nova.keypair
+        description: Must name a public key (pair) known to Nova
+
+
+resources:
+
+  
+  # --- Scripts d'initialisation des instances ---
+  init_lab_env_init:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ungrouped
+      config: |
+        #!/bin/bash
+        # Avoid  the sudo unable to resolve
+        echo $(hostname -I | cut -d\  -f1) $(hostname) | sudo tee -a /etc/hosts
+        # /etc/hosts config
+        cp -p /etc/hosts /etc/hosts.DIST
+        sed -i 1i$'192.168.61.50    registry' /etc/hosts
+        sed -i 1i$'192.168.61.40    gateway' /etc/hosts
+        sed -i 1i$'192.168.61.34    node04' /etc/hosts
+        sed -i 1i$'192.168.61.33    node03' /etc/hosts
+        sed -i 1i$'192.168.61.32    node02' /etc/hosts
+        sed -i 1i$'192.168.61.31    node01' /etc/hosts
+
+  # --- 
+  init_cloud_user_init:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ungrouped
+      config: |
+        #!/bin/bash
+        # Enable password Authentification, and set ubuntu password
+        sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+        service sshd restart
+        echo "ubuntu:cloud" | chpasswd
+        # Creation de l'utilisateur cloud
+        if [ ! $(getent group cloud) ]; then
+          groupadd cloud
+        fi
+        if [ ! $(getent passwd cloud) ]; then
+          useradd -g cloud       -s /bin/bash -d /home/cloud  -m  cloud
+          cd /etc/sudoers.d
+          echo "cloud ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/50_cloud_sh
+          chmod 440 /etc/sudoers.d/50_cloud_sh
+          echo "cloud:cloud" | chpasswd
+        fi
+        # Autoriser l'utilisateur Cloud a utiliser Docker, si docker est installé
+        if [ $(getent group docker) ]; then
+          sudo usermod -aG docker cloud;
+          # Dupliquer la config docker pour l'utilisateur cloud (proxy)
+          if [ -d /root/.docker ]; then
+            cp -rp  /root/.docker /home/cloud
+            chown -R cloud.cloud .docker/
+          fi
+        fi
+
+  # --- 
+  add_nginx_init:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ungrouped
+      config: |
+        #!/bin/bash
+        # set environement for installation and non interactive update
+        export DEBIAN_FRONTEND=noninteractive
+        export TERM="xterm"
+        # Install Nginx
+        # - Update the apt package index, and install the latest version 
+        sudo apt-get update
+        sudo apt-get install -y nginx-light
+        # - Activer nginx
+        sudo systemctl enable nginx
+        sudo systemctl start nginx
+
+  # --- 
+  add_docker_init:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ungrouped
+      config: |
+        #!/bin/bash
+        if ! command -v docker &> /dev/null
+        then
+            # set environement for installation and non interactive update
+            export DEBIAN_FRONTEND=noninteractive
+            export TERM="xterm"
+            # Set up the repository
+            # - Update the apt package index and install packages to allow apt to use a repository over HTTPS:
+            sudo apt-get update
+            sudo apt-get install -y \
+                ca-certificates \
+                curl \
+                gnupg \
+                lsb-release
+            #  - Add Docker’s official GPG key:
+            sudo mkdir -p /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            # set up the repository:
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            # Install Docker Engine
+            # - Update the apt package index, and install the latest version 
+            sudo apt-get update
+            sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+            # Activer docker
+            sudo systemctl enable docker
+            sudo systemctl start docker
+        fi
+        # configurer la registry mirroir
+        sudo tee /etc/docker/daemon.json > /dev/null <<EOF
+        {
+          "dns": ["192.44.75.10", "192.108.115.2"],
+          "registry-mirrors": ["http://registry"]
+        }
+        EOF
+        # configurer le proxy
+        sudo tee /etc/systemd/system/docker.service.d/proxy.conf > /dev/null <<EOF
+        [Service]
+        Environment='HTTP_PROXY=http://proxy.enst-bretagne.fr:8080'
+        Environment='HTTPS_PROXY=http://proxy.enst-bretagne.fr:8080'
+        Environment='NO_PROXY=127.0.0.1,localhost,docker,.0,.1,.2,.3,.4,.5,.6,.7,.8,.9,.imt-atlantique.fr,.telecom-bretagne.eu,.enst-bretagne.fr,registry'
+        EOF
+        systemctl daemon-reload
+        systemctl restart docker
+
+  # --- 
+  docker_registry_init:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      group: ungrouped
+      config: |
+        #!/bin/bash
+        mkdir -p /root/registry
+        sudo tee /root/registry/docker-compose.yml > /dev/null <<EOF
+        version: '3'
+        services:
+          registry:
+            image: registry:2
+            restart: always
+            ports:
+              - "80:5000"
+            environment:
+              REGISTRY_PROXY_REMOTEURL: https://registry-1.docker.io
+            volumes:
+              - registry_datas:/var/lib/registry
+        volumes:
+          registry_datas:
+        EOF
+        cd /root/registry
+        docker compose up -d
+
+
+
+
+  # ----------------------------------------------
+
+  # --- Config Reseau ----------------------------
+  private_network:
+    type: OS::Neutron::Net
+    properties:
+      name: net-swarmlab
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name: subnet-swarmlab
+      network_id: { get_resource: private_network }
+      cidr: 192.168.61.0/24
+      allocation_pools:
+        -  { start: 192.168.61.100, end: 192.168.61.254}
+      dns_nameservers:
+        - 192.44.75.10
+        - 192.108.115.2
+
+  private_router:
+    type: OS::Neutron::Router
+    properties:
+      name: router-swarmlab
+      external_gateway_info:
+        network: external
+
+  router-interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: private_router }
+      subnet: { get_resource: private_subnet }
+  # ----------------------------------------------
+
+  # --- Gestion des droits d'accès ---------------
+  admin_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: sg-swarmlab-admin
+      rules:
+        # PING
+        - protocol: icmp
+        # SSH
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+
+  internal_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: "Open all the ports inside the private network"
+      name: sg-internal
+      rules:
+        - remote_ip_prefix: 192.168.61.0/24
+          protocol: tcp
+        - remote_ip_prefix: 192.168.61.0/24
+          protocol: udp
+        - remote_ip_prefix: 192.168.61.0/24
+          protocol: icmp
+
+  manager_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: sg-swarmlab-manager
+      rules:
+        # Grafana
+        - protocol: tcp
+          port_range_min: 3000
+          port_range_max: 3000
+        # visualizer
+        - protocol: tcp
+          port_range_min: 8060
+          port_range_max: 8060
+        # webapp
+        - protocol: tcp
+          port_range_min: 8061
+          port_range_max: 8061
+        # app-access 
+        - protocol: tcp
+          port_range_min: 8062
+          port_range_max: 8062
+        # portainer-tunnel
+        - protocol: tcp
+          port_range_min: 8000
+          port_range_max: 8000
+        #  portainer-ui
+        - protocol: tcp
+          port_range_min: 9443 
+          port_range_max: 9443
+        # cadvisor
+        - protocol: tcp
+          port_range_min: 8080
+          port_range_max: 8080
+        # prometheus
+        - protocol: tcp
+          port_range_min: 9090
+          port_range_max: 9090
+        #  push-gateway 
+        - protocol: tcp
+          port_range_min: 9091
+          port_range_max: 9091
+        # alertmanager
+        - protocol: tcp
+          port_range_min: 9093
+          port_range_max: 9093
+        # node-exporter
+        - protocol: tcp
+          port_range_min: 9100
+          port_range_max: 9100
+        # elasticsearch
+        - protocol: tcp
+          port_range_min: 9200
+          port_range_max: 9200
+
+  gateway_security_group:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: sg-swarmlab-gateway
+      rules:
+        # app-access 
+        - protocol: tcp
+          port_range_min: 8062
+          port_range_max: 8062
+
+  # ----------------------------------------------
+
+  # ----------------------------------------------
+  # --- Declaration des noeuds --------------------
+  # ----------------------------------------------
+  # config
+  #  init_lab_env_init
+  #  init_cloud_user_init
+  #  add_docker_init
+  #  add_nginx_init
+  docker_node_init:
+    type: OS::Heat::MultipartMime
+    properties:
+      parts:
+      - config: {get_resource: add_docker_init}
+      - config: {get_resource: init_cloud_user_init}
+      - config: {get_resource: init_lab_env_init}
+
+  docker_registry_node_init:
+    type: OS::Heat::MultipartMime
+    properties:
+      parts:
+      - config: {get_resource: add_docker_init}
+      - config: {get_resource: init_cloud_user_init}
+      - config: {get_resource: init_lab_env_init}
+      - config: {get_resource: docker_registry_init }
+  
+  # --- node01
+  node01_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_resource: private_network }
+      fixed_ips: 
+        - { ip_address: 192.168.61.31, subnet: { get_resource: private_subnet } }
+      security_groups:
+        - { get_resource: internal_security_group }
+        - { get_resource: admin_security_group }
+        - { get_resource: manager_security_group }
+
+  node01_floating_ip:
+    type: OS::Neutron::FloatingIP
+    depends_on: router-interface
+    properties:
+      floating_network: external
+      port_id: { get_resource: node01_port }
+
+  node01_instance:
+    type: OS::Nova::Server
+    properties:
+      name: node01
+      image: imta-docker
+      flavor: s10.small
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: node01_port }
+      user_data_format: RAW
+      user_data:
+        get_resource: docker_node_init
+
+  # --- node02
+  node02_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_resource: private_network }
+      fixed_ips: 
+        - { ip_address: 192.168.61.32, subnet: { get_resource: private_subnet } }
+      security_groups:
+        - { get_resource: internal_security_group }      
+
+  node02_instance:
+    type: OS::Nova::Server
+    properties:
+      name: node02
+      image: imta-docker
+      flavor: s10.small
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: node02_port }
+      user_data_format: RAW
+      user_data:
+        get_resource: docker_node_init
+
+  # --- node03
+  node03_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_resource: private_network }
+      fixed_ips: 
+        - { ip_address: 192.168.61.33, subnet: { get_resource: private_subnet } }
+      security_groups:
+        - { get_resource: internal_security_group }
+
+  node03_instance:
+    type: OS::Nova::Server
+    properties:
+      name: node03
+      image: imta-docker
+      flavor: s10.small
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: node03_port }
+      user_data_format: RAW
+      user_data:
+        get_resource: docker_node_init
+
+  # --- node04
+  node04_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_resource: private_network }
+      fixed_ips: 
+        - { ip_address: 192.168.61.34, subnet: { get_resource: private_subnet } }
+      security_groups:
+        - { get_resource: internal_security_group }
+
+  node04_instance:
+    type: OS::Nova::Server
+    properties:
+      name: node04
+      image: imta-docker
+      flavor: s10.small
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: node04_port }
+      user_data_format: RAW
+      user_data:
+        get_resource: docker_node_init
+
+# --- gateway
+  gateway_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_resource: private_network }
+      fixed_ips: 
+         - { ip_address: 192.168.61.40, subnet: { get_resource: private_subnet } }
+      security_groups:
+        - { get_resource: internal_security_group }
+        - { get_resource: admin_security_group }
+        - { get_resource: gateway_security_group }
+
+  gateway_floating_ip:
+    type: OS::Neutron::FloatingIP
+    depends_on: router-interface
+    properties:
+      floating_network: external
+      port_id: { get_resource: gateway_port }
+
+  gateway_instance:
+    type: OS::Nova::Server
+    properties:
+      name: gateway
+      image: imta-ubuntu22
+      flavor: m1.small
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: gateway_port }
+      user_data_format: RAW
+      user_data:
+        get_resource: init_cloud_user_init
+        get_resource: init_lab_env_init
+
+  # --- registry
+  registry_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_resource: private_network }
+      fixed_ips: 
+         - { ip_address: 192.168.61.50, subnet: { get_resource: private_subnet } }
+      security_groups:
+        - { get_resource: internal_security_group }
+
+  registry_instance:
+    type: OS::Nova::Server
+    properties:
+      name: registry
+      image: imta-docker
+      flavor: s10.small
+      key_name: { get_param: key }
+      networks:
+        - port: { get_resource: registry_port }
+      user_data_format: RAW
+      user_data:
+        get_resource: docker_registry_node_init
+
+
+# ----------------------------------------------
+# OUTPUTS
+# ----------------------------------------------
+    
+outputs:
+  manager_ip_output:
+    description: The Floating IP assigned to the manager instance
+    value: { get_attr: [node01_floating_ip, floating_ip_address] }
+
+  gateway_ip_output:
+    description: The Floating IP assigned to gateway 
+    value: { get_attr: [gateway_floating_ip, floating_ip_address] }
+
